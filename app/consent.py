@@ -29,7 +29,7 @@ def check_consent(
     2. 未被撤销；
     3. 未过期；
     4. 授权范围覆盖所需 scope；
-    5. 若指定账户，账户须归属该同意对应的客户。
+    5. 若指定账户，账户须存在且归属该同意对应的客户。
     """
     with store.lock:
         consent = store.consents.get(consent_id)
@@ -43,6 +43,8 @@ def check_consent(
             return ConsentDecision(False, DenialReason.SCOPE_INSUFFICIENT)
         if account_id is not None:
             account = store.accounts.get(account_id)
-            if account is None or account.customer_id != consent.customer_id:
+            if account is None:
+                return ConsentDecision(False, DenialReason.ACCOUNT_NOT_FOUND)
+            if account.customer_id != consent.customer_id:
                 return ConsentDecision(False, DenialReason.RESOURCE_NOT_OWNED)
         return ConsentDecision(True)

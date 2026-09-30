@@ -3,16 +3,29 @@ from __future__ import annotations
 
 import time
 import uuid
+from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.consent import check_consent
-from app.events import EventDispatcher
+from app.events import (
+    CallbackRejectedError,
+    DeliveryNotFound,
+    EventDispatcher,
+    RedeliverNotAllowed,
+)
 from app.idempotency import IdempotencyConflict, run_idempotent
-from app.models import Account, Consent, ConsentStatus, LedgerEntry, Subscription
+from app.models import (
+    Account,
+    Consent,
+    ConsentStatus,
+    DenialReason,
+    LedgerEntry,
+    Subscription,
+)
 from app.store import Store
 
 
@@ -30,7 +43,7 @@ class AccountIn(BaseModel):
 
 class PaymentIn(BaseModel):
     account_id: str
-    amount_cents: int
+    amount_cents: int = Field(gt=0)
     memo: str = ""
 
 
@@ -41,20 +54,36 @@ class SubscriptionIn(BaseModel):
     secret: str
 
 
+class InsufficientFunds(Exception):
+    """余额不足：业务拒绝，不得改动账本。"""
+
+
 def _http_sender(url: str, body: bytes, headers: dict[str, str]) -> None:
     resp = httpx.post(url, content=body, headers=headers, timeout=5.0)
-    resp.raise_for_status()
+    if resp.is_error:
+        # 订阅方应答了但拒绝：与网络不可达区分开
+        raise CallbackRejectedError(resp.status_code, resp.text[:200])
 
 
-def create_app(sender=None) -> FastAPI:
+def create_app(
+    sender=None, *, workers: int = 2, max_attempts: int = 3, backoff_base: float = 0.05
+) -> FastAPI:
     app = FastAPI(title="Open Banking Integration Layer")
     store = Store()
     app.state.store = store
-    app.state.dispatcher = EventDispatcher(store, sender=sender or _http_sender)
+    app.state.dispatcher = EventDispatcher(
+        store,
+        sender=sender or _http_sender,
+        workers=workers,
+        max_attempts=max_attempts,
+        backoff_base=backoff_base,
+    )
 
     def deny(reason) -> JSONResponse:
+        # 资源不存在与其余授权拒绝使用不同状态码，便于调用方区分
+        status = 404 if reason == DenialReason.ACCOUNT_NOT_FOUND else 403
         return JSONResponse(
-            status_code=403,
+            status_code=status,
             content={"error": "consent_denied", "reason": reason.value},
         )
 
@@ -90,9 +119,14 @@ def create_app(sender=None) -> FastAPI:
         return {"consent_id": consent.consent_id, "expires_at": consent.expires_at}
 
     @app.post("/consents/{consent_id}/revoke")
-    def revoke_consent(consent_id: str) -> dict:
+    def revoke_consent(consent_id: str):
         with store.lock:
-            consent = store.consents[consent_id]
+            consent = store.consents.get(consent_id)
+            if consent is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "consent_not_found"},
+                )
             consent.status = ConsentStatus.REVOKED
         return {"consent_id": consent_id, "status": consent.status.value}
 
@@ -108,7 +142,21 @@ def create_app(sender=None) -> FastAPI:
         return {"account_id": account.account_id}
 
     @app.post("/subscriptions", status_code=201)
-    def create_subscription(body: SubscriptionIn) -> dict:
+    def create_subscription(body: SubscriptionIn):
+        # 无效订阅请求：明确业务拒绝，不落库
+        problems = []
+        if not body.event_types:
+            problems.append("event_types must not be empty")
+        if not body.secret:
+            problems.append("secret must not be empty")
+        parsed = urlparse(body.callback_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            problems.append("callback_url must be a valid http(s) URL")
+        if problems:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_subscription", "detail": problems},
+            )
         sub = Subscription(
             subscription_id=str(uuid.uuid4()),
             partner_id=body.partner_id,
@@ -121,19 +169,47 @@ def create_app(sender=None) -> FastAPI:
         return {"subscription_id": sub.subscription_id}
 
     @app.get("/deliveries")
-    def list_deliveries() -> list[dict]:
+    def list_deliveries(status: str | None = Query(default=None)) -> list[dict]:
         with store.lock:
-            return [
-                {
-                    "delivery_id": d.delivery_id,
-                    "event_id": d.event_id,
-                    "subscription_id": d.subscription_id,
-                    "status": d.status.value,
-                    "attempts": d.attempts,
-                    "last_error": d.last_error,
-                }
-                for d in store.deliveries.values()
-            ]
+            deliveries = list(store.deliveries.values())
+        if status is not None:
+            deliveries = [d for d in deliveries if d.status.value == status]
+        return [
+            {
+                "delivery_id": d.delivery_id,
+                "event_id": d.event_id,
+                "subscription_id": d.subscription_id,
+                "status": d.status.value,
+                "attempts": d.attempts,
+                "last_error": d.last_error,
+                "failure_kind": d.failure_kind.value if d.failure_kind else None,
+                "redelivery_of": d.redelivery_of,
+            }
+            for d in deliveries
+        ]
+
+    @app.post("/deliveries/{delivery_id}/redeliver", status_code=201)
+    def redeliver_delivery(delivery_id: str):
+        """对最终失败的投递发起重投：生成一条全新的、可追踪的投递记录。"""
+        try:
+            delivery = app.state.dispatcher.redeliver(delivery_id)
+        except DeliveryNotFound:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "delivery_not_found"},
+            )
+        except RedeliverNotAllowed as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "redeliver_not_allowed",
+                    "detail": str(exc),
+                },
+            )
+        return {
+            "delivery_id": delivery.delivery_id,
+            "redelivery_of": delivery.redelivery_of,
+        }
 
     # ---- 受保护入口 ----
 
@@ -168,6 +244,11 @@ def create_app(sender=None) -> FastAPI:
         def action() -> tuple[dict, int]:
             with store.lock:
                 account = store.accounts[body.account_id]
+                if account.balance_cents < body.amount_cents:
+                    # 余额不足：业务拒绝，账本与事件投递都不发生
+                    raise InsufficientFunds(
+                        f"balance {account.balance_cents} < amount {body.amount_cents}"
+                    )
                 account.balance_cents -= body.amount_cents
                 store.ledger.append(
                     LedgerEntry(
@@ -178,7 +259,7 @@ def create_app(sender=None) -> FastAPI:
                     )
                 )
                 new_balance = account.balance_cents
-            app.state.dispatcher.publish(
+            deliveries = app.state.dispatcher.publish(
                 "payment.completed",
                 {
                     "account_id": body.account_id,
@@ -190,6 +271,7 @@ def create_app(sender=None) -> FastAPI:
                 "payment_id": str(uuid.uuid4()),
                 "account_id": body.account_id,
                 "balance_cents": new_balance,
+                "deliveries_created": len(deliveries),
             }, 201
 
         try:
@@ -200,6 +282,11 @@ def create_app(sender=None) -> FastAPI:
             return JSONResponse(
                 status_code=409,
                 content={"error": "idempotency_conflict", "detail": str(exc)},
+            )
+        except InsufficientFunds as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"error": "insufficient_funds", "detail": str(exc)},
             )
         return JSONResponse(
             status_code=result.status_code,

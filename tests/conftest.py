@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.events import CallbackRejectedError, EventDispatcher
 from app.main import create_app
 
 logging.basicConfig(
@@ -14,18 +17,34 @@ logger = logging.getLogger("openbanking.tests")
 
 
 class FakeSender:
-    """可控投递发送器：记录每次投递，可按需注入失败。"""
+    """可控投递发送器：记录每次投递，可注入延迟、瞬时失败、持续失败与拒绝。
+
+    后台 worker 线程会并发调用，因此内部状态用锁保护。
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, bytes, dict[str, str]]] = []
-        self.failures_before_success = 0  # 前 N 次抛异常
-        self.always_fail = False
+        self.failures_before_success = 0  # 前 N 次抛 ConnectionError
+        self.always_fail = False  # 始终抛 ConnectionError（模拟不可达）
+        self.reject_status: int | None = None  # 始终抛 CallbackRejectedError
+        self.delay = 0.0  # 每次调用前睡眠秒数（模拟慢回调）
+        self._lock = threading.Lock()
 
     def __call__(self, url: str, body: bytes, headers: dict[str, str]) -> None:
-        self.calls.append((url, body, headers))
-        if self.always_fail or self.failures_before_success > 0:
-            self.failures_before_success -= 0 if self.always_fail else 1
-            raise ConnectionError("simulated delivery failure")
+        if self.delay > 0:
+            time.sleep(self.delay)
+        with self._lock:
+            self.calls.append((url, body, headers))
+            if self.reject_status is not None:
+                raise CallbackRejectedError(self.reject_status, "simulated rejection")
+            if self.always_fail or self.failures_before_success > 0:
+                if not self.always_fail:
+                    self.failures_before_success -= 1
+                raise ConnectionError("simulated delivery failure")
+
+    def call_count(self) -> int:
+        with self._lock:
+            return len(self.calls)
 
 
 @pytest.fixture()
@@ -34,9 +53,18 @@ def sender() -> FakeSender:
 
 
 @pytest.fixture()
-def client(sender: FakeSender) -> TestClient:
-    app = create_app(sender=sender)
+def app(sender: FakeSender):
+    return create_app(sender=sender)
+
+
+@pytest.fixture()
+def client(app) -> TestClient:
     return TestClient(app)
+
+
+@pytest.fixture()
+def dispatcher(app) -> EventDispatcher:
+    return app.state.dispatcher
 
 
 @pytest.fixture()
