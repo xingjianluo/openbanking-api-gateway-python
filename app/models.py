@@ -19,6 +19,7 @@ class DenialReason(str, enum.Enum):
     CONSENT_EXPIRED = "consent_expired"
     SCOPE_INSUFFICIENT = "scope_insufficient"
     RESOURCE_NOT_OWNED = "resource_not_owned"
+    RESOURCE_NOT_FOUND = "resource_not_found"
 
 
 @dataclass
@@ -69,10 +70,41 @@ class Subscription:
     secret: str  # 用于投递签名
 
 
+@dataclass
+class Event:
+    event_id: str
+    event_type: str
+    payload: dict = field(default_factory=dict)
+    created_at: float = 0.0
+
+
 class DeliveryStatus(str, enum.Enum):
+    # 已入队、等待后台 worker 首次处理
     PENDING = "pending"
+    # 已被某个 worker 原子领取、正在投递（瞬时态，防止重复投递）
+    IN_FLIGHT = "in_flight"
+    # 尝试失败、等待退避窗口后再次入队
+    RETRYING = "retrying"
+    # 已成功投递（终态）
     DELIVERED = "delivered"
-    FAILED = "failed"  # 重试耗尽
+    # 重试耗尽的最终失败（终态，可作为重投入口）
+    FAILED = "failed"
+    # 订阅本身无效（回调地址非法等），重试无意义（终态）
+    INVALID_SUBSCRIPTION = "invalid_subscription"
+    # 订阅方明确拒绝（4xx），重试无意义（终态）
+    REJECTED = "rejected"
+    # 事件没有任何匹配订阅者（只出现在事件级查询中）
+    NO_SUBSCRIBER = "no_subscriber"
+
+
+class DeliveryFailureKind(str, enum.Enum):
+    """投递失败的可区分分类（写入 Delivery.failure_kind）。"""
+
+    SUBSCRIBER_REJECTED = "subscriber_rejected"  # 订阅方返回 4xx
+    NETWORK_UNREACHABLE = "network_unreachable"  # 连接/超时等传输错误
+    INVALID_SUBSCRIPTION = "invalid_subscription"  # 回调地址非法
+    SERVER_ERROR = "server_error"  # 订阅方 5xx，按可重试错误处理
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -83,10 +115,14 @@ class Delivery:
     status: DeliveryStatus = DeliveryStatus.PENDING
     attempts: int = 0
     last_error: str | None = None
-
-
-@dataclass
-class Event:
-    event_id: str
-    event_type: str
-    payload: dict = field(default_factory=dict)
+    failure_kind: DeliveryFailureKind | None = None
+    # 状态流转时间戳
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    # 退避后允许再次尝试的最早时间（仅 RETRYING 有意义）
+    next_attempt_at: float = 0.0
+    # IN_FLIGHT 租约到期时间：worker 崩溃时扫描器据此回收，超时投递可能重复，
+    # 由订阅方按 event_id 去重（至少一次语义）
+    lease_expires_at: float = 0.0
+    # 重投时指向最初那条失败记录，形成可追踪的重投链
+    origin_delivery_id: str | None = None

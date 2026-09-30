@@ -43,6 +43,9 @@ def check_consent(
             return ConsentDecision(False, DenialReason.SCOPE_INSUFFICIENT)
         if account_id is not None:
             account = store.accounts.get(account_id)
-            if account is None or account.customer_id != consent.customer_id:
+            if account is None:
+                # 针对不存在/已失效资源的操作：明确 not_found，绝不落库或猜测归属。
+                return ConsentDecision(False, DenialReason.RESOURCE_NOT_FOUND)
+            if account.customer_id != consent.customer_id:
                 return ConsentDecision(False, DenialReason.RESOURCE_NOT_OWNED)
         return ConsentDecision(True)

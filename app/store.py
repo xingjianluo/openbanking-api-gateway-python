@@ -7,6 +7,7 @@ from app.models import (
     Account,
     Consent,
     Delivery,
+    Event,
     IdempotencyRecord,
     LedgerEntry,
     Subscription,
@@ -24,4 +25,5 @@ class Store:
         self.ledger: list[LedgerEntry] = []
         self.idempotency: dict[str, IdempotencyRecord] = {}
         self.subscriptions: dict[str, Subscription] = {}
+        self.events: dict[str, Event] = {}
         self.deliveries: dict[str, Delivery] = {}
