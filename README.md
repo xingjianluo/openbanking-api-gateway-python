@@ -91,6 +91,23 @@ tests/            pytest 测试（日志打印关键输入与判定依据）
   - 对不存在的投递返回 404 `delivery_not_found`；
   - 重投只重发事件回调，不触碰账本，同一笔支付不会被重复扣款。
 
+### 重投防重复：一条失败记录最多生效一次
+
+- 每条失败记录**最多派生一次重投**：重投成功登记新记录的同时，在原
+  记录上原子置位 `superseded_by`（检查与置位在同一把锁内完成）。
+  之后再对这条原始记录发起重投，一律返回 409 `already_redelivered`
+  （响应体带 `superseded_by` 指向已派生的新记录），与
+  `redeliver_not_allowed` 可区分。
+- **并发安全**：重复点击、并发重试同一个 `delivery_id` 时，最多一个
+  请求得到 201，其余全部 409，不会多造投递记录，订阅方不会收到
+  第二次成功回调——并发结果与串行逐一发起完全一致。
+- **失败可继续重投**：若派生出的新投递仍然 `failed`，可对**那条新
+  记录**继续重投，形成 `redelivery_of` / `superseded_by` 双向可追踪
+  的重投链；链上任何已被取代的旧记录都不能再重投。
+- **可观察**：`GET /deliveries` 中每条记录带 `status`、`redelivery_of`
+  （从哪条记录重投而来）与 `superseded_by`（被哪条重投取代），
+  当前是失败还是已成功、重投链的走向都一目了然。
+
 ### 并发与容量下的预期边界
 
 - 对外接口的响应时间与回调耗时**无关**：支付路径上只有常数时间的
@@ -149,6 +166,12 @@ curl -s 'localhost:8000/deliveries?status=failed'
 
 # 对最终失败的投递发起重投（生成新的可追踪投递记录）
 curl -s -X POST localhost:8000/deliveries/<delivery_id>/redeliver
+
+# 对同一条失败记录再次重投：409 already_redelivered（带 superseded_by）
+curl -s -X POST localhost:8000/deliveries/<delivery_id>/redeliver
+
+# 观察重投链：redelivery_of / superseded_by 双向指向，status 标明终态
+curl -s localhost:8000/deliveries
 ```
 
 关键场景对应的自动化测试：
@@ -158,6 +181,9 @@ curl -s -X POST localhost:8000/deliveries/<delivery_id>/redeliver
 | 慢回调不拖慢支付接口                       | `tests/test_delivery_async.py::test_slow_callback_does_not_slow_payment_api` |
 | 大量事件积压下接口有响应上限且最终全部送达 | `tests/test_delivery_async.py::test_burst_backlog_drains_without_blocking_api` |
 | 重试耗尽后重投，不重复扣款、不重复成功投递 | `tests/test_delivery_async.py::test_redeliver_after_exhaustion_no_duplicate_effects` |
+| 同一失败记录二次重投被拒，订阅方只成功收到一次 | `tests/test_redeliver_once.py::test_second_redeliver_of_same_record_rejected` |
+| 并发重投同一失败记录只生效一次             | `tests/test_redeliver_once.py::test_concurrent_redeliver_only_one_takes_effect` |
+| 重投仍失败可对新记录继续重投（链式可追踪） | `tests/test_redeliver_once.py::test_failed_redelivery_can_be_redelivered_again` |
 | 在途投递不允许重投                         | `tests/test_delivery_async.py::test_redeliver_in_flight_delivery_rejected` |
 | 四类失败结论可区分                         | `tests/test_delivery_async.py::test_failure_kinds_are_distinguishable` |
 | 边界拒绝无副作用                           | `tests/test_delivery_async.py::test_rejected_boundary_requests_have_no_side_effects` |

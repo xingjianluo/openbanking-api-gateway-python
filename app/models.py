@@ -95,6 +95,7 @@ class Delivery:
     last_error: str | None = None
     failure_kind: FailureKind | None = None  # 最后一次失败的类别
     redelivery_of: str | None = None  # 若为重投产生的新投递，指向原 delivery_id
+    superseded_by: str | None = None  # 已被哪条重投记录取代；一条失败记录最多派生一次重投
 
 
 @dataclass

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from app.consent import check_consent
 from app.events import (
+    AlreadyRedelivered,
     CallbackRejectedError,
     DeliveryNotFound,
     EventDispatcher,
@@ -184,6 +185,7 @@ def create_app(
                 "last_error": d.last_error,
                 "failure_kind": d.failure_kind.value if d.failure_kind else None,
                 "redelivery_of": d.redelivery_of,
+                "superseded_by": d.superseded_by,
             }
             for d in deliveries
         ]
@@ -204,6 +206,15 @@ def create_app(
                 content={
                     "error": "redeliver_not_allowed",
                     "detail": str(exc),
+                },
+            )
+        except AlreadyRedelivered as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "already_redelivered",
+                    "detail": str(exc),
+                    "superseded_by": exc.superseded_by,
                 },
             )
         return {

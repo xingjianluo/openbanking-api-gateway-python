@@ -65,6 +65,17 @@ class RedeliverNotAllowed(Exception):
         self.status = status
 
 
+class AlreadyRedelivered(Exception):
+    """该失败记录已经派生过重投（无论那次重投成败），不允许再次重投。"""
+
+    def __init__(self, delivery_id: str, superseded_by: str) -> None:
+        super().__init__(
+            f"delivery {delivery_id} was already redelivered as {superseded_by}"
+        )
+        self.delivery_id = delivery_id
+        self.superseded_by = superseded_by
+
+
 def _valid_callback_url(url: str) -> bool:
     return url.startswith(("http://", "https://")) and len(url) > len("https://")
 
@@ -77,9 +88,11 @@ class EventDispatcher:
     - worker：后台线程按插入序（FIFO）领取 PENDING 投递，置为 IN_PROGRESS
       后执行重试循环；重试耗尽置 FAILED 并保留 attempts / last_error /
       failure_kind，过程可通过 GET /deliveries 实时观察。
-    - redeliver：仅允许 FAILED 投递；生成一条全新的 Delivery
-      （redelivery_of 指向原记录），走一次完整可追踪的新投递过程。
-      已 DELIVERED 的投递拒绝重投，保证不会对订阅方产生第二次成功投递。
+    - redeliver：仅允许 FAILED 且尚未被重投过的投递；生成一条全新的
+      Delivery（redelivery_of 指向原记录），并在原记录上原子置位
+      superseded_by。因此同一条失败记录无论串行还是并发重投都最多
+      生效一次，订阅方不会收到第二次成功投递；若新投递仍失败，可对
+      新记录继续重投，形成可追踪的重投链。
     """
 
     def __init__(
@@ -139,19 +152,28 @@ class EventDispatcher:
         return deliveries
 
     def redeliver(self, delivery_id: str) -> Delivery:
-        """对最终失败的投递发起一次新的、可追踪的投递。"""
+        """对最终失败的投递发起一次新的、可追踪的投递。
+
+        一条失败记录最多派生一次重投：检查与置位 superseded_by 在同一把
+        锁内完成，因此并发重复重投只有一方生效，其余得到 AlreadyRedelivered，
+        与串行执行的结果一致。若派生出的新投递仍然失败，可继续对那条
+        新记录重投（它有自己的 superseded_by），不受影响。
+        """
         with self.store.lock:
             original = self.store.deliveries.get(delivery_id)
             if original is None:
                 raise DeliveryNotFound(delivery_id)
             if original.status != DeliveryStatus.FAILED:
                 raise RedeliverNotAllowed(original.status)
+            if original.superseded_by is not None:
+                raise AlreadyRedelivered(original.delivery_id, original.superseded_by)
             delivery = Delivery(
                 delivery_id=str(uuid.uuid4()),
                 event_id=original.event_id,
                 subscription_id=original.subscription_id,
                 redelivery_of=original.delivery_id,
             )
+            original.superseded_by = delivery.delivery_id  # 先占位再登记，原子生效
             self.store.deliveries[delivery.delivery_id] = delivery
         logger.info(
             "redeliver %s -> new delivery %s", original.delivery_id, delivery.delivery_id
