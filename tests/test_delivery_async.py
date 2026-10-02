@@ -122,7 +122,11 @@ def test_redeliver_after_exhaustion_no_duplicate_effects(
     old = deliveries[original["delivery_id"]]
     logger.info("after redeliver: old=%s new=%s", old, new)
     assert new["status"] == "delivered" and new["attempts"] == 1
-    assert old["status"] == "failed" and old["attempts"] == 3, "原记录保持终态不变"
+    assert old["status"] == "redelivered", "成功重投补救后，原记录转为 redelivered"
+    assert old["attempts"] == 3, "原记录的失败历史（attempts）保留可追踪"
+    assert old["last_error"] is not None, "原记录的失败原因保留可追踪"
+    assert old["failure_kind"] == "callback_unreachable"
+    assert new["redelivery_of"] == original["delivery_id"], "新记录可溯源到原记录"
 
     # 不产生重复业务副作用
     assert sender.call_count() == 4, "重投只追加一次成功投递（3 失败 + 1 成功）"
@@ -133,8 +137,18 @@ def test_redeliver_after_exhaustion_no_duplicate_effects(
     logger.info("redeliver delivered one -> %s %s", conflict.status_code, conflict.json())
     assert conflict.status_code == 409
     assert conflict.json()["error"] == "redeliver_not_allowed"
+
+    # 关键回归：对**原始失败记录**再点一次重投，必须被明确拒绝（可区分的冲突），
+    # 订阅方不能因此再收到一次成功投递
+    repeat = client.post(f"/deliveries/{original['delivery_id']}/redeliver")
+    logger.info(
+        "repeat redeliver original -> %s %s", repeat.status_code, repeat.json()
+    )
+    assert repeat.status_code == 409
+    assert repeat.json()["error"] == "redeliver_conflict"
+    assert repeat.json()["reason"] == "already_redelivered"
     assert dispatcher.wait_idle(5)
-    assert sender.call_count() == 4, "已成功的投递不得被重复投递"
+    assert sender.call_count() == 4, "重复重投不得产生任何额外回调"
 
     missing = client.post("/deliveries/no-such-id/redeliver")
     assert missing.status_code == 404

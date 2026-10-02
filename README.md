@@ -63,10 +63,13 @@ tests/            pytest 测试（日志打印关键输入与判定依据）
 - 投递语义不倒退：
   - **不丢**：投递先落库（内存存储）再处理，积压以 `Delivery` 记录
     形式存在，worker 按自身节奏排空；
-  - **可观察**：`GET /deliveries`（支持 `?status=` 过滤）实时查看
-    `status / attempts / last_error / failure_kind`，重试退避过程可见；
-  - **不重复成功**：已成功（`delivered`）的投递到达终态后不再被任何
-    后续处理重复投递（重投仅对 `failed` 开放，见下）。
+  - **可观察**：`GET /deliveries`（支持 `?status=` 过滤，如
+    `?status=failed` / `?status=redelivered`）实时查看
+    `status / attempts / last_error / failure_kind / redelivery_of`，
+    重试退避与重投来源均可见；
+  - **不重复成功**：`delivered` 是终态、不可重投；`failed` 记录一旦被
+    一次成功的重投补救即转为终态 `redelivered`，不会被任何后续处理
+    （含重复点击、并发重投）重复投递。
 
 ### 重试、最终失败与重投
 
@@ -84,11 +87,37 @@ tests/            pytest 测试（日志打印关键输入与判定依据）
 
 - **重投**：`POST /deliveries/{delivery_id}/redeliver` 仅接受 `failed`
   状态的投递，返回 201 并生成一条**全新的 `Delivery`**
-  （`redelivery_of` 指向原记录），走一次完整、可独立追踪的投递过程；
-  原记录保持 `failed` 终态不变。
-  - 对 `delivered / pending / in_progress` 的投递重投返回
-    409 `redeliver_not_allowed`，保证订阅方不会收到第二次成功投递；
-  - 对不存在的投递返回 404 `delivery_not_found`；
+  （`redelivery_of` 指向原记录），走一次完整、可独立追踪的投递过程。
+
+  重投规则（允许与拒绝）：
+
+  | 目标记录状态                         | 结果                                              |
+  |--------------------------------------|---------------------------------------------------|
+  | `failed` 且无在途/已成功的重投       | 201，登记一条新投递                               |
+  | `failed` 但已有**在途**重投          | 409 `redeliver_conflict` / `redelivery_in_progress` |
+  | `failed` 但已有过**成功**重投        | 409 `redeliver_conflict` / `already_redelivered`  |
+  | `redelivered`（已被成功重投补救）    | 409 `redeliver_conflict` / `already_redelivered`  |
+  | `pending` / `in_progress` / `delivered` | 409 `redeliver_not_allowed`                    |
+  | 记录不存在                           | 404 `delivery_not_found`                          |
+
+  - **一次成功，永久收口**：一条失败记录一旦被重投成功，原记录（以及同一
+    根失败记录下之前重投失败过的兄弟尝试）会被标记为新终态
+    `redelivered`，此后再对其中任何一条发起重投都返回**可区分的冲突错误**
+    `redeliver_conflict`（`reason=already_redelivered`），订阅方不会收到
+    第二次成功回调，也不会新增投递记录或任何其他业务副作用。
+  - **并发重投最多生效一次**：判定与登记在同一把存储锁内原子完成，判定
+    范围是**同一根失败记录的整棵重投树**——无论请求是对原失败记录发起，
+    还是对某条重投失败后的子记录发起，只要树中已存在
+    `pending/in_progress` 的在途重投，并发重复发起就返回 409
+    `redeliver_conflict`（`reason=redelivery_in_progress`）。并发结果与
+    一条条串行发起完全一致，不会因抢跑多造出一次成功投递。
+  - **失败不锁死，仍可继续重投**：若新的一次重投最终**仍然失败**，新记录
+    为 `failed`、原记录也保持 `failed`，仍然允许继续重投；直到某次重投
+    成功，整条链才收敛为 `redelivered`。
+  - **状态可追踪**：`GET /deliveries` 可看到每条记录当前状态
+    （`failed` / `redelivered` / `delivered` 等）与 `redelivery_of`
+    来源；被收口的原记录保留 `attempts / last_error / failure_kind`
+    历史失败痕迹，只改状态，不丢排查信息。
   - 重投只重发事件回调，不触碰账本，同一笔支付不会被重复扣款。
 
 ### 并发与容量下的预期边界
@@ -149,7 +178,31 @@ curl -s 'localhost:8000/deliveries?status=failed'
 
 # 对最终失败的投递发起重投（生成新的可追踪投递记录）
 curl -s -X POST localhost:8000/deliveries/<delivery_id>/redeliver
+
+# 重投成功后，原记录变为 redelivered（保留失败痕迹），可对比观察
+curl -s 'localhost:8000/deliveries'
+
+# 对同一条原始失败记录再点一次重投：409 redeliver_conflict / already_redelivered，
+# 订阅方不会收到第二次成功回调
+curl -s -i -X POST localhost:8000/deliveries/<delivery_id>/redeliver
 ```
+
+并发重投"最多生效一次"可在本地用并发请求复现（下面 10 个请求中应恰好
+1 个 201，其余 9 个为 409 `redeliver_conflict`，订阅方只被成功回调一次）：
+
+```bash
+# 先制造一条 failed 记录（不可达回调 + 等待重试耗尽），再并发重投
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w '%{http_code}\n' \
+    -X POST localhost:8000/deliveries/<failed_delivery_id>/redeliver &
+done; wait
+# 结果应只有一行 201；随后再串行重投一次仍为 409 / already_redelivered
+```
+
+> 自动化复现无需真实网络：`tests/conftest.py` 的 `FakeSender` 可注入
+> 持续失败、成功、慢回调；对应场景由
+> `tests/test_redelivery_guard.py` 守护（并发用线程屏障对齐发出时机，
+> 可稳定复现）。
 
 关键场景对应的自动化测试：
 
@@ -159,6 +212,11 @@ curl -s -X POST localhost:8000/deliveries/<delivery_id>/redeliver
 | 大量事件积压下接口有响应上限且最终全部送达 | `tests/test_delivery_async.py::test_burst_backlog_drains_without_blocking_api` |
 | 重试耗尽后重投，不重复扣款、不重复成功投递 | `tests/test_delivery_async.py::test_redeliver_after_exhaustion_no_duplicate_effects` |
 | 在途投递不允许重投                         | `tests/test_delivery_async.py::test_redeliver_in_flight_delivery_rejected` |
+| 同一失败记录连续两次重投：第二次被拒且订阅方只成功一次 | `tests/test_redelivery_guard.py::test_second_redeliver_after_success_is_conflict` |
+| 并发重复重投最多生效一次（HTTP 层）        | `tests/test_redelivery_guard.py::test_concurrent_redeliver_only_one_takes_effect` |
+| 并发重复重投最多生效一次（dispatcher 层，在途冲突可区分） | `tests/test_redelivery_guard.py::test_dispatcher_level_concurrent_redeliver_raises_distinct_conflict` |
+| 跨链并发重投（分别对原记录与失败子记录重投）只生效一次 | `tests/test_redelivery_guard.py::test_concurrent_redeliver_of_original_and_failed_child_only_one_takes_effect` |
+| 重投仍失败可继续重投、成功后全链收口、状态可追踪 | `tests/test_redelivery_guard.py::test_failed_redelivery_keeps_record_retryable_until_success` |
 | 四类失败结论可区分                         | `tests/test_delivery_async.py::test_failure_kinds_are_distinguishable` |
 | 边界拒绝无副作用                           | `tests/test_delivery_async.py::test_rejected_boundary_requests_have_no_side_effects` |
 | 签名与篡改识别、重试退避、失败原因分离     | `tests/test_events.py` |

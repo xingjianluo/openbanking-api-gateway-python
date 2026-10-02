@@ -75,6 +75,7 @@ class DeliveryStatus(str, enum.Enum):
     IN_PROGRESS = "in_progress"  # worker 正在投递（含重试退避中）
     DELIVERED = "delivered"
     FAILED = "failed"  # 重试耗尽，进入最终失败状态，可重投
+    REDELIVERED = "redelivered"  # 失败记录已被一次成功的重投补救，禁止再次重投
 
 
 class FailureKind(str, enum.Enum):

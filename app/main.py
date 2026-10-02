@@ -15,6 +15,7 @@ from app.events import (
     CallbackRejectedError,
     DeliveryNotFound,
     EventDispatcher,
+    RedeliverConflict,
     RedeliverNotAllowed,
 )
 from app.idempotency import IdempotencyConflict, run_idempotent
@@ -203,6 +204,16 @@ def create_app(
                 status_code=409,
                 content={
                     "error": "redeliver_not_allowed",
+                    "detail": str(exc),
+                },
+            )
+        except RedeliverConflict as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "redeliver_conflict",
+                    "reason": exc.reason,
+                    "active_delivery_id": exc.active_delivery_id,
                     "detail": str(exc),
                 },
             )

@@ -65,6 +65,21 @@ class RedeliverNotAllowed(Exception):
         self.status = status
 
 
+class RedeliverConflict(Exception):
+    """目标失败记录的重投存在冲突：已有成功重投或并发重投在途。
+
+    reason 取值：
+    - already_redelivered：该失败记录已经有过一次成功的重投，拒绝再次重投；
+    - redelivery_in_progress：已存在一条在途（pending/in_progress）重投，
+      并发重复发起被拒绝。
+    """
+
+    def __init__(self, reason: str, active_delivery_id: str | None = None) -> None:
+        super().__init__(f"redelivery conflict: {reason}")
+        self.reason = reason
+        self.active_delivery_id = active_delivery_id
+
+
 def _valid_callback_url(url: str) -> bool:
     return url.startswith(("http://", "https://")) and len(url) > len("https://")
 
@@ -79,7 +94,11 @@ class EventDispatcher:
       failure_kind，过程可通过 GET /deliveries 实时观察。
     - redeliver：仅允许 FAILED 投递；生成一条全新的 Delivery
       （redelivery_of 指向原记录），走一次完整可追踪的新投递过程。
-      已 DELIVERED 的投递拒绝重投，保证不会对订阅方产生第二次成功投递。
+      已 DELIVERED 的投递拒绝重投；一条失败记录一旦有过一次成功的重投，
+      原记录被标记为 REDELIVERED，此后再次重投一律返回明确冲突；
+      已存在在途重投时，并发重复发起也会被拒绝，因此同一条失败记录
+      最多只会有一次真正生效的重投。重投若仍失败，原记录与新记录
+      都保持 FAILED，仍可继续重投。
     """
 
     def __init__(
@@ -139,13 +158,31 @@ class EventDispatcher:
         return deliveries
 
     def redeliver(self, delivery_id: str) -> Delivery:
-        """对最终失败的投递发起一次新的、可追踪的投递。"""
+        """对最终失败的投递发起一次新的、可追踪的投递。
+
+        在同一把存储锁内完成全部前置判定与登记，因此并发重复重投与串行
+        重投结果一致：同一条失败记录最多只允许一条重投真正生效。
+        """
         with self.store.lock:
             original = self.store.deliveries.get(delivery_id)
             if original is None:
                 raise DeliveryNotFound(delivery_id)
+            # 已经被成功重投补救过的失败记录：明确冲突，永不再投
+            if original.status == DeliveryStatus.REDELIVERED:
+                raise RedeliverConflict("already_redelivered")
             if original.status != DeliveryStatus.FAILED:
                 raise RedeliverNotAllowed(original.status)
+            # 同一根失败记录的整棵重投树中，只要已存在在途或已成功的重投
+            # （覆盖"对原记录重投"与"对失败重投再重投"并发的跨链场景）：
+            # 拒绝并发/重复发起，保证最多一次真正生效
+            active = self._active_redelivery_in_tree(delivery_id)
+            if active is not None:
+                raise RedeliverConflict(
+                    "already_redelivered"
+                    if active.status == DeliveryStatus.DELIVERED
+                    else "redelivery_in_progress",
+                    active.delivery_id,
+                )
             delivery = Delivery(
                 delivery_id=str(uuid.uuid4()),
                 event_id=original.event_id,
@@ -158,6 +195,42 @@ class EventDispatcher:
         )
         self._wake.set()
         return delivery
+
+    def _active_redelivery_in_tree(self, delivery_id: str) -> Delivery | None:
+        """在以 delivery_id 的根失败记录为根的整棵重投树中查找活跃重投。
+
+        先沿 redelivery_of 上溯到根，再沿 redelivery_of 关系做 BFS：
+        除目标自身外，任一重投处于 pending/in_progress（在途，并发重投
+        必须被拒）或 delivered（已经成功过）即返回它；failed 的重投视为
+        尝试失败，不阻塞继续重投。调用方须持有 store.lock。
+        """
+        root_id = delivery_id
+        node = self.store.deliveries[delivery_id]
+        while node.redelivery_of is not None:
+            parent = self.store.deliveries.get(node.redelivery_of)
+            if parent is None:
+                break
+            root_id = parent.delivery_id
+            node = parent
+        frontier = [root_id]
+        seen: set[str] = set()
+        while frontier:
+            parent_ids = set(frontier)
+            seen |= parent_ids
+            children = [
+                d
+                for d in self.store.deliveries.values()
+                if d.redelivery_of in parent_ids and d.delivery_id not in seen
+            ]
+            for child in children:
+                if child.status in (
+                    DeliveryStatus.PENDING,
+                    DeliveryStatus.IN_PROGRESS,
+                    DeliveryStatus.DELIVERED,
+                ):
+                    return child
+            frontier = [c.delivery_id for c in children]
+        return None
 
     def wait_idle(self, timeout: float = 5.0) -> bool:
         """等待积压投递全部到达终态（测试与运维观察用）；超时返回 False。"""
@@ -265,6 +338,51 @@ class EventDispatcher:
             if status == DeliveryStatus.DELIVERED:
                 delivery.last_error = None
                 delivery.failure_kind = None
+                # 成功的重投补救其整条失败记录：沿 redelivery_of 找到根失败记录，
+                # 再把根下整棵重投子树中仍为 failed 的记录全部转为 redelivered
+                # （覆盖"同一条失败记录先后发起多次重投、部分尝试失败"形成的
+                # 兄弟节点），确保此后对其中任何一条再发起重投都会被明确冲突
+                # 拒绝，订阅方不会因任一残留 failed 记录而再次收到成功回调。
+                # 各记录的 attempts/last_error/failure_kind 作为历史痕迹保留。
+                self._mark_redelivery_subtree_resolved(delivery)
             else:
                 delivery.last_error = error
                 delivery.failure_kind = kind
+
+    def _mark_redelivery_subtree_resolved(self, successful: Delivery) -> None:
+        """成功重投落定后，收敛其根失败记录下整棵重投子树。调用方须持锁。"""
+        root_id = successful.delivery_id
+        node = successful
+        while node.redelivery_of is not None:
+            root_id = node.redelivery_of
+            parent = self.store.deliveries.get(node.redelivery_of)
+            if parent is None:
+                break
+            node = parent
+        frontier = [root_id]
+        seen: set[str] = set()
+        while frontier:
+            parent_ids = set(frontier)
+            seen |= parent_ids
+            children = [
+                d
+                for d in self.store.deliveries.values()
+                if d.redelivery_of in parent_ids and d.delivery_id not in seen
+            ]
+            for child in children:
+                if child.status == DeliveryStatus.FAILED:
+                    child.status = DeliveryStatus.REDELIVERED
+                    logger.info(
+                        "failed delivery %s resolved by successful redelivery %s",
+                        child.delivery_id,
+                        successful.delivery_id,
+                    )
+            frontier = [c.delivery_id for c in children]
+        root = self.store.deliveries.get(root_id)
+        if root is not None and root.status == DeliveryStatus.FAILED:
+            root.status = DeliveryStatus.REDELIVERED
+            logger.info(
+                "failed delivery %s resolved by successful redelivery %s",
+                root.delivery_id,
+                successful.delivery_id,
+            )
